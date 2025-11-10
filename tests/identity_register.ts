@@ -16,6 +16,7 @@ describe("identity_register", () => {
 
   // Define test data
   const testUsername = "sol_user_123";
+  const testSymbol = "IDENTITY";
   const testUri = "https://arweave.net/my-profile-json";
 
   // Calculate the PDA for the authority's identity account
@@ -28,15 +29,18 @@ describe("identity_register", () => {
   );
 
   it("1. Registers a new identity!", async () => {
+    // Generate a new mint keypair for the NFT
+    const mintKeypair = anchor.web3.Keypair.generate();
+
     // --- Act ---
     // Call the `registerIdentity` instruction
     const tx = await program.methods
-      .registerIdentity(testUsername, testUri)
+      .registerIdentity(testUsername, testSymbol, testUri)
       .accounts({
-        identityAccount: identityPda,
         authority: authority.publicKey,
-        systemProgram: anchor.web3.SystemProgram.programId,
-      } as any)
+        mint: mintKeypair.publicKey,
+      })
+      .signers([mintKeypair])
       .rpc();
     
     console.log("Your transaction signature", tx);
@@ -49,19 +53,26 @@ describe("identity_register", () => {
     assert.ok(accountData.authority.equals(authority.publicKey), "Authority mismatch");
     assert.strictEqual(accountData.username, testUsername, "Username mismatch");
     assert.strictEqual(accountData.uri, testUri, "URI mismatch");
+
+    console.log("✅ Identity registered successfully!");
+    console.log("  Username:", accountData.username);
+    console.log("  NFT Mint:", mintKeypair.publicKey.toBase58());
   });
 
   it("2. Fails to register a duplicate identity!", async () => {
+    // Generate another mint keypair
+    const mintKeypair2 = anchor.web3.Keypair.generate();
+
     // --- Act & Assert ---
     // Try to call the same instruction again for the same user
     try {
       await program.methods
-        .registerIdentity("new_username", "new_uri") // Different data
+        .registerIdentity("new_username", "NEW_SYM", "new_uri") // Different data
         .accounts({
-          identityAccount: identityPda, // Same PDA
           authority: authority.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        } as any)
+          mint: mintKeypair2.publicKey,
+        })
+        .signers([mintKeypair2])
         .rpc();
       
       // If the above doesn't throw an error, force the test to fail
@@ -71,6 +82,7 @@ describe("identity_register", () => {
       // We expect an error, so this is a pass.
       // Anchor will throw an error because the account PDA is already in use.
       assert.include(err.message, "already in use", "Expected 'already in use' error");
+      console.log("✅ Correctly prevented duplicate identity registration");
     }
   });
 
@@ -85,7 +97,7 @@ describe("identity_register", () => {
     // Airdrop some SOL to the new user so they can pay for the account
     const airdropSig = await provider.connection.requestAirdrop(
       newUser.publicKey,
-      1 * anchor.web3.LAMPORTS_PER_SOL // 1 SOL
+      2 * anchor.web3.LAMPORTS_PER_SOL // 2 SOL
     );
     // Wait for the airdrop to confirm
     const latestBlockhash = await provider.connection.getLatestBlockhash();
@@ -104,16 +116,18 @@ describe("identity_register", () => {
       program.programId
     );
 
+    // Generate a new mint keypair for this test
+    const mintKeypair3 = anchor.web3.Keypair.generate();
+
     // --- Act & Assert ---
     try {
       await program.methods
-        .registerIdentity(longUsername, testUri)
+        .registerIdentity(longUsername, testSymbol, testUri)
         .accounts({
-          identityAccount: newUserPda,
           authority: newUser.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-        } as any)
-        .signers([newUser]) // The new user must sign
+          mint: mintKeypair3.publicKey,
+        })
+        .signers([newUser, mintKeypair3]) // Both the new user and mint must sign
         .rpc();
 
       assert.fail("Transaction should have failed (username too long)!");
@@ -127,8 +141,18 @@ describe("identity_register", () => {
           "UsernameTooLong",
           `Expected program error 'UsernameTooLong', got: ${JSON.stringify(err.error)}`
         );
+        console.log("✅ Correctly rejected username that is too long");
         return;
       }
+      
+      // If it's a different error format, check the message
+      if (err.message && err.message.includes("UsernameTooLong")) {
+        console.log("✅ Correctly rejected username that is too long");
+        return;
+      }
+      
+      // If we got here, it's an unexpected error
+      throw new Error(`Unexpected error: ${err.message || JSON.stringify(err)}`);
     }
   });
 });
