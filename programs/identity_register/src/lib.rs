@@ -24,6 +24,10 @@ pub mod identity_register {
         if username.len() > 50 {
             return err!(ErrorCode::UsernameTooLong);
         }
+
+        if uri.len() > 200 {
+            return err!(ErrorCode::UriTooLong);
+        }
         
         identity.authority = ctx.accounts.authority.key();
         identity.username = username.clone();
@@ -110,6 +114,21 @@ pub mod identity_register {
 
         Ok(())
     }
+
+    // Initialize a reputation account for an existing identity
+    pub fn initialize_reputation(ctx: Context<InitializeReputation>) -> Result<()> {
+        let reputation_account = &mut ctx.accounts.reputation_account;
+        
+        reputation_account.authority = ctx.accounts.authority.key();
+        reputation_account.total_transactions = 0;
+        reputation_account.total_volume = 0;
+        reputation_account.total_reviews = 0;
+        reputation_account.total_rating_score = 0;
+        reputation_account.bump = ctx.bumps.reputation_account;
+
+        msg!("Reputation account created for authority {}", reputation_account.authority);
+        Ok(())
+    }
 }
 
 // Custom program errors
@@ -117,6 +136,9 @@ pub mod identity_register {
 pub enum ErrorCode {
     #[msg("Username is too long (max 50 characters)")]
     UsernameTooLong,
+
+    #[msg("URI is too long (max 200 characters)")]
+    UriTooLong,
 }
 
 // This struct defines all the accounts required by our `register_identity` instruction
@@ -195,11 +217,75 @@ pub struct RegisterIdentity<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
+#[derive(Accounts)]
+pub struct InitializeReputation<'info> {
+    // The agent (authority) who is creating their reputation account
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    // The identity account, used as a check to ensure the signer
+    // is a registered agent.
+    #[account(
+        seeds = [b"identity", authority.key().as_ref()],
+        bump = identity_account.bump,
+        // We constrain that the authority on the identity account
+        // matches the signer.
+        has_one = authority
+    )]
+    pub identity_account: Account<'info, IdentityAccount>,
+
+    // The new reputation account PDA
+    #[account(
+        init,
+        payer = authority,
+        // Space = 8 (disc) + 32 (auth) + 8 (txns) + 8 (vol) + 8 (reviews) + 8 (rating) + 1 (bump)
+        space = 8 + 32 + 8 + 8 + 8 + 8 + 1,
+        seeds = [b"reputation", authority.key().as_ref()],
+        bump
+    )]
+    pub reputation_account: Account<'info, ReputationAccount>,
+
+    pub system_program: Program<'info, System>,
+}
+
 // This struct defines the data to be stored in the `IdentityAccount`
 #[account]
 pub struct IdentityAccount {
     pub authority: Pubkey,
     pub username: String, // e.g., "alice"
     pub uri: String,      // e.g., "https://arweave.net/..."
+    pub bump: u8,
+}
+
+// Stores the aggregate reputation for a single agent (authority)
+#[account]
+pub struct ReputationAccount {
+    // Pubkey of the agent this reputation belongs to
+    pub authority: Pubkey,
+    // Total number of services/transactions completed
+    pub total_transactions: u64,
+    // Total volume of payments processed (e.g., in USDC lamports)
+    pub total_volume: u64,
+    // Total number of reviews received
+    pub total_reviews: u64,
+    // The sum of all review scores (e.g., 10 for two 5-star reviews)
+    pub total_rating_score: u64,
+    // Bump for the PDA
+    pub bump: u8,
+}
+
+// Stores a single review left by a user for an agent
+#[account]
+pub struct ReviewAccount {
+    // The agent who was reviewed
+    pub agent_authority: Pubkey,
+    // The user who wrote the review
+    pub reviewer: Pubkey,
+    // The rating, e.g., 1-5
+    pub rating: u8,
+    // Link to IPFS/Arweave with the review text/details
+    // Max 200 chars
+    pub uri: String,
+    // Bump
     pub bump: u8,
 }
