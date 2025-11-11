@@ -5,7 +5,7 @@ use anchor_spl::{
         create_master_edition_v3, create_metadata_accounts_v3, CreateMasterEditionV3,
         CreateMetadataAccountsV3, Metadata,
     },
-    token::{mint_to, Mint, MintTo, Token, TokenAccount},
+    token::{mint_to, transfer, Mint, MintTo, Token, TokenAccount, Transfer},
 };
 use mpl_token_metadata::types::{Creator, DataV2};
 
@@ -129,6 +129,41 @@ pub mod identity_register {
         msg!("Reputation account created for authority {}", reputation_account.authority);
         Ok(())
     }
+
+    pub fn log_service_transaction(ctx: Context<LogServiceTransaction>, amount: u64) -> Result<()> {
+        // 1. CPI to transfer tokens from payer to agent
+        msg!("Transferring {} tokens from payer to agent", amount);
+        
+        // We use the `transfer` function from the `anchor_spl::token` crate
+        transfer(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.payer_token_account.to_account_info(),
+                    to: ctx.accounts.agent_token_account.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            amount,
+        )?;
+        msg!("Transfer complete");
+
+        // 2. Update the agent's reputation account
+        let reputation_account = &mut ctx.accounts.reputation_account;
+        
+        // Use checked_add to prevent overflow
+        reputation_account.total_transactions = reputation_account.total_transactions.checked_add(1)
+            .ok_or(ErrorCode::Overflow)?;
+        
+        reputation_account.total_volume = reputation_account.total_volume.checked_add(amount)
+            .ok_or(ErrorCode::Overflow)?;
+        
+        msg!("Reputation updated for {}", reputation_account.authority);
+        msg!("  Total Transactions: {}", reputation_account.total_transactions);
+        msg!("  Total Volume: {}", reputation_account.total_volume);
+
+        Ok(())
+    }
 }
 
 // Custom program errors
@@ -139,6 +174,9 @@ pub enum ErrorCode {
 
     #[msg("URI is too long (max 200 characters)")]
     UriTooLong,
+
+    #[msg("Arithmetic overflow")]
+    Overflow,
 }
 
 // This struct defines all the accounts required by our `register_identity` instruction
@@ -245,6 +283,52 @@ pub struct InitializeReputation<'info> {
     )]
     pub reputation_account: Account<'info, ReputationAccount>,
 
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct LogServiceTransaction<'info> {
+    // The user paying for the service
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: This is the agent (identity) being paid.
+    /// We validate it by checking its relationship to the reputation_account.
+    pub authority: AccountInfo<'info>,
+
+    // The agent's reputation account (to be updated)
+    #[account(
+        mut,
+        seeds = [b"reputation", authority.key().as_ref()],
+        bump = reputation_account.bump,
+        // Crucial check: ensures this reputation account
+        // belongs to the agent_authority we are paying.
+        has_one = authority
+    )]
+    pub reputation_account: Account<'info, ReputationAccount>,
+
+    // The mint of the token being transferred (e.g., USDC)
+    pub mint: Account<'info, Mint>,
+
+    // The payer's token account (from which to send)
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = payer,
+    )]
+    pub payer_token_account: Account<'info, TokenAccount>,
+    
+    // The agent's token account (to receive payment)
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = authority,
+    )]
+    pub agent_token_account: Account<'info, TokenAccount>,
+
+    // Required programs
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
