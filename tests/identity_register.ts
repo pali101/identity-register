@@ -2,6 +2,12 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { IdentityRegister } from "../target/types/identity_register";
 import { assert } from "chai";
+import { 
+  getOrCreateAssociatedTokenAccount, 
+  createMint, 
+  mintTo, 
+  getAccount 
+} from "@solana/spl-token";
 
 describe("identity_register", () => {
   // Configure the client to use the local cluster.
@@ -12,7 +18,9 @@ describe("identity_register", () => {
   const program = anchor.workspace.IdentityRegister as Program<IdentityRegister>;
   
   // The wallet of the person running the test
-  const authority = provider.wallet as anchor.Wallet;
+  const wallet = provider.wallet as anchor.Wallet;
+  const authority = wallet.publicKey;
+  const authorityKeypair = (wallet as any).payer as anchor.web3.Keypair;
 
   // Define test data
   const testUsername = "sol_user_123";
@@ -23,7 +31,7 @@ describe("identity_register", () => {
   const [identityPda] = anchor.web3.PublicKey.findProgramAddressSync(
     [
       Buffer.from("identity"), 
-      authority.publicKey.toBuffer()
+      authority.toBuffer()
     ],
     program.programId
   );
@@ -32,10 +40,17 @@ describe("identity_register", () => {
   const [reputationPda] = anchor.web3.PublicKey.findProgramAddressSync(
     [
       Buffer.from("reputation"), 
-      authority.publicKey.toBuffer()
+      authority.toBuffer()
     ],
     program.programId
   );
+
+  let mockUsdcMint: anchor.web3.PublicKey;
+  let payerUser: anchor.web3.Keypair;
+  let payerTokenAccount: anchor.web3.PublicKey;
+  let agentTokenAccount: anchor.web3.PublicKey;
+  // 50 USDC (assuming 6 decimals)
+  const transactionAmount = new anchor.BN(50 * 1_000_000);
 
   // --- Helper to airdrop to new users ---
   const airdrop = async (user: anchor.web3.PublicKey) => {
@@ -52,6 +67,55 @@ describe("identity_register", () => {
     });
   };
 
+  // This 'before' block runs once before all tests
+  // We use it to set up our mock token and accounts
+  before(async () => {
+    // 1. Create a new user to be the 'payer'
+    payerUser = anchor.web3.Keypair.generate();
+    await airdrop(payerUser.publicKey);
+    console.log(`Payer user created: ${payerUser.publicKey.toBase58()}`);
+
+    // 2. Create a mock USDC mint (6 decimals)
+    // The 'authority' wallet will be the mint authority
+    mockUsdcMint = await createMint(
+      provider.connection,
+      authorityKeypair, // Payer/minter is the 'authority' wallet
+      authority, // Mint authority
+      null, // Freeze authority
+      6 // Decimals
+    );
+    console.log(`Mock USDC Mint: ${mockUsdcMint.toBase58()}`);
+
+    // 3. Create ATA for the payer
+    payerTokenAccount = (await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      payerUser, // Payer to create/fund ATA
+      mockUsdcMint,
+      payerUser.publicKey
+    )).address;
+    console.log(`Payer ATA: ${payerTokenAccount.toBase58()}`);
+
+    // 4. Create ATA for the agent (our main 'authority')
+    agentTokenAccount = (await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      payerUser, // Payer to create/fund ATA
+      mockUsdcMint,
+      authority // Owner is the agent
+    )).address;
+    console.log(`Agent ATA: ${agentTokenAccount.toBase58()}`);
+
+    // 5. Mint 1000 mock USDC to the payer
+    await mintTo(
+      provider.connection,
+      authorityKeypair, 
+      mockUsdcMint,
+      payerTokenAccount,
+      authority, // Mint authority
+      1000 * 1_000_000 // 1000 USDC
+    );
+    console.log("Minted 1000 USDC to payer");
+  });
+
   it("1. Registers a new identity!", async () => {
     // Generate a new mint keypair for the NFT
     const mintKeypair = anchor.web3.Keypair.generate();
@@ -61,7 +125,7 @@ describe("identity_register", () => {
     const tx = await program.methods
       .registerIdentity(testUsername, testSymbol, testUri)
       .accounts({
-        authority: authority.publicKey,
+        authority: authority,
         mint: mintKeypair.publicKey,
       })
       .signers([mintKeypair])
@@ -74,7 +138,7 @@ describe("identity_register", () => {
     const accountData = await program.account.identityAccount.fetch(identityPda);
 
     // Check if the data was stored correctly
-    assert.ok(accountData.authority.equals(authority.publicKey), "Authority mismatch");
+    assert.ok(accountData.authority.equals(authority), "Authority mismatch");
     assert.strictEqual(accountData.username, testUsername, "Username mismatch");
     assert.strictEqual(accountData.uri, testUri, "URI mismatch");
 
@@ -93,7 +157,7 @@ describe("identity_register", () => {
       await program.methods
         .registerIdentity("new_username", "NEW_SYM", "new_uri") // Different data
         .accounts({
-          authority: authority.publicKey,
+          authority: authority,
           mint: mintKeypair2.publicKey,
         })
         .signers([mintKeypair2])
@@ -201,7 +265,7 @@ describe("identity_register", () => {
     const tx = await program.methods
       .initializeReputation()
       .accounts({
-        authority: authority.publicKey,
+        authority: authority,
         identityAccount: identityPda, // Pass the existing identity PDA
         reputationAccount: reputationPda, // Pass the new PDA to be created
       })
@@ -213,7 +277,7 @@ describe("identity_register", () => {
     const accountData = await program.account.reputationAccount.fetch(reputationPda);
 
     // Check if the data was initialized correctly
-    assert.ok(accountData.authority.equals(authority.publicKey), "Authority mismatch");
+    assert.ok(accountData.authority.equals(authority), "Authority mismatch");
     // Use .toNumber() because u64 fields are returned as BN (BigNumber)
     assert.strictEqual(accountData.totalTransactions.toNumber(), 0, "Transactions not 0");
     assert.strictEqual(accountData.totalVolume.toNumber(), 0, "Volume not 0");
@@ -230,7 +294,7 @@ describe("identity_register", () => {
       await program.methods
         .initializeReputation()
         .accounts({
-          authority: authority.publicKey,
+          authority: authority,
           identityAccount: identityPda,
           reputationAccount: reputationPda,
         })
@@ -285,4 +349,55 @@ describe("identity_register", () => {
       console.log("✅ Correctly failed (identity account not initialized)");
     }
   });
+
+  it("8. Logs a service transaction successfully!", async () => {
+    // --- Arrange ---
+    // Fetch pre-transaction state
+    const repAccountPre = await program.account.reputationAccount.fetch(reputationPda);
+    const payerTokenPre = await getAccount(provider.connection, payerTokenAccount);
+    const agentTokenPre = await getAccount(provider.connection, agentTokenAccount);
+
+    // 1000 USDC (from the 'before' block)
+    assert.equal(payerTokenPre.amount.toString(), (1000 * 1_000_000).toString(), "Payer pre-balance incorrect");
+    assert.equal(agentTokenPre.amount.toString(), "0", "Agent pre-balance incorrect");
+
+    // --- Act ---
+    const tx = await program.methods
+      .logServiceTransaction(transactionAmount) // 50 USDC
+      .accounts({
+        payer: payerUser.publicKey,
+        authority: authority, // Needed so Anchor knows which agent to pay
+        mint: mockUsdcMint,
+      } as any) 
+      .signers([payerUser]) // The payer must sign
+      .rpc();
+    
+    console.log("Your transaction signature", tx);
+
+    // --- Assert ---
+    // 1. Check reputation account
+    const repAccountPost = await program.account.reputationAccount.fetch(reputationPda);
+    const expectedTxns = repAccountPre.totalTransactions.toNumber() + 1;
+    const expectedVolume = repAccountPre.totalVolume.add(transactionAmount);
+
+    assert.equal(repAccountPost.totalTransactions.toNumber(), expectedTxns, "Total transactions did not increment");
+    assert.ok(repAccountPost.totalVolume.eq(expectedVolume), "Total volume did not update correctly");
+
+    // 2. Check token balances
+    const payerTokenPost = await getAccount(provider.connection, payerTokenAccount);
+    const agentTokenPost = await getAccount(provider.connection, agentTokenAccount);
+
+    const expectedPayerBalance = (1000 - 50) * 1_000_000; // 950
+    const expectedAgentBalance = 50 * 1_000_000; // 50
+
+    assert.equal(payerTokenPost.amount.toString(), expectedPayerBalance.toString(), "Payer post-balance incorrect");
+    assert.equal(agentTokenPost.amount.toString(), expectedAgentBalance.toString(), "Agent post-balance incorrect");
+
+    console.log("✅ Service transaction logged successfully!");
+    console.log(`  Agent Transactions: ${repAccountPost.totalTransactions.toNumber()}`);
+    console.log(`  Agent Volume: ${repAccountPost.totalVolume.toString()}`);
+    console.log(`  Payer Balance: ${payerTokenPost.amount.toString()}`);
+    console.log(`  Agent Balance: ${agentTokenPost.amount.toString()}`);
+  });
+
 });
